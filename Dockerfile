@@ -27,11 +27,12 @@ RUN go build \
 FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /runtime-cache /cache
-COPY --from=builder /out/llm-proxy /llm-proxy
+COPY --from=builder /runtime-cache /app/cache
+COPY --from=builder /out/llm-proxy /app/llm-proxy
 
+WORKDIR /app
 USER 65532:65532
 EXPOSE 8318
 
-ENTRYPOINT ["/llm-proxy"]
+ENTRYPOINT ["/app/llm-proxy"]
 CMD ["-config", "/config.yaml"]
