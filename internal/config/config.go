@@ -123,7 +123,7 @@ func Load(filename string) (*Config, error) {
 func defaultConfig() Config {
 	return Config{
 		Server: ServerConfig{
-			Listen:                      ":8318",
+			Listen:                      ":9917",
 			ReadHeaderTimeout:           Duration{defaultReadHeaderTimeout},
 			IdleTimeout:                 Duration{defaultIdleTimeout},
 			ShutdownTimeout:             Duration{defaultShutdownTimeout},

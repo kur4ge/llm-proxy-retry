@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     command: ["-config", "/config.yaml"]
     ports:
-      - "8318:8318"
+      - "9917:9917"
     volumes:
       - ./config.yaml:/config.yaml:ro
     restart: unless-stopped

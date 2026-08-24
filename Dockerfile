@@ -32,7 +32,7 @@ COPY --from=builder /out/llm-proxy /app/llm-proxy
 
 WORKDIR /app
 USER 65532:65532
-EXPOSE 8318
+EXPOSE 9917
 
 ENTRYPOINT ["/app/llm-proxy"]
 CMD ["-config", "/config.yaml"]
