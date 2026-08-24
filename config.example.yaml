@@ -6,7 +6,7 @@ server:
   max_request_body_bytes: 67108864
   memory_request_body_bytes: 1048576
   max_inspect_response_body_bytes: 4194304
-  temp_dir: ""
+  temp_dir: "/app/cache"
 
 transport:
   dial_timeout: 10s

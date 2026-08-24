@@ -21,13 +21,13 @@ RUN go build \
     -ldflags="-s -w" \
     -o /out/llm-proxy \
     ./cmd/llm-proxy \
-    && mkdir -p /runtime-tmp \
-    && chmod 1777 /runtime-tmp
+    && mkdir -p /runtime-cache \
+    && chmod 1777 /runtime-cache
 
 FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /runtime-tmp /tmp
+COPY --from=builder /runtime-cache /cache
 COPY --from=builder /out/llm-proxy /llm-proxy
 
 USER 65532:65532
