@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"llm-proxy-retry/internal/config"
@@ -97,12 +98,32 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	requestID := h.requestSequence.Add(1)
 	selectedRoute := h.router.match(request.URL.Path)
 	if selectedRoute == nil {
+		h.logger.Debug("request received",
+			"request_id", requestID,
+			"method", request.Method,
+			"content_length", request.ContentLength,
+		)
 		http.NotFound(writer, request)
+		h.logRejected(requestID, request.Method, "", http.StatusNotFound, "route_not_found", started)
 		return
 	}
+	h.logger.Debug("request received",
+		"request_id", requestID,
+		"method", request.Method,
+		"route", selectedRoute.prefix,
+		"content_length", request.ContentLength,
+	)
 
 	if request.ContentLength > h.maxRequestBodyBytes {
 		http.Error(writer, "request body exceeds configured limit", http.StatusRequestEntityTooLarge)
+		h.logRejected(
+			requestID,
+			request.Method,
+			selectedRoute.prefix,
+			http.StatusRequestEntityTooLarge,
+			"request_body_too_large",
+			started,
+		)
 		return
 	}
 	requestBody, err := readRequestBody(
@@ -114,14 +135,24 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if err != nil {
 		if errors.Is(err, errRequestBodyTooLarge) {
 			http.Error(writer, err.Error(), http.StatusRequestEntityTooLarge)
+			h.logRejected(
+				requestID,
+				request.Method,
+				selectedRoute.prefix,
+				http.StatusRequestEntityTooLarge,
+				"request_body_too_large",
+				started,
+			)
 		} else if request.Context().Err() == nil {
 			http.Error(writer, "failed to read request body", http.StatusBadRequest)
 			h.logger.Warn("failed to buffer request body",
 				"request_id", requestID,
 				"method", request.Method,
-				"path", request.URL.Path,
-				"error", err,
+				"route", selectedRoute.prefix,
+				"error_kind", classifyError(err, false),
 			)
+		} else {
+			h.logCanceled(requestID, request.Method, selectedRoute.prefix, "", 0, started)
 		}
 		return
 	}
@@ -129,12 +160,17 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		if err := requestBody.close(); err != nil {
 			h.logger.Warn("failed to remove request body temp file",
 				"request_id", requestID,
-				"error", err,
+				"error_kind", "temp_file_cleanup",
 			)
 		}
 	}()
 
 	selectedBackend := selectedRoute.choose(time.Now())
+	h.logger.Debug("backend selected",
+		"request_id", requestID,
+		"route", selectedRoute.prefix,
+		"backend", selectedBackend.name,
+	)
 	deadline := started.Add(selectedBackend.maxRetryDuration)
 	attempts := 0
 	var lastFailure failure
@@ -142,6 +178,14 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	for {
 		if err := selectedBackend.waitUntilReady(request.Context(), deadline); err != nil {
 			if request.Context().Err() != nil {
+				h.logCanceled(
+					requestID,
+					request.Method,
+					selectedRoute.prefix,
+					selectedBackend.name,
+					attempts,
+					started,
+				)
 				return
 			}
 			h.writeFailure(writer, lastFailure)
@@ -160,14 +204,33 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				http.Error(writer, "failed to prepare downstream request", http.StatusInternalServerError)
 				h.logger.Error("failed to prepare downstream request",
 					"request_id", requestID,
+					"method", request.Method,
+					"route", selectedRoute.prefix,
 					"backend", selectedBackend.name,
-					"error", err,
+					"error_kind", "request_body_replay",
+					"duration_ms", time.Since(started).Milliseconds(),
+				)
+			} else {
+				h.logCanceled(
+					requestID,
+					request.Method,
+					selectedRoute.prefix,
+					selectedBackend.name,
+					attempts,
+					started,
 				)
 			}
 			return
 		}
 
 		attempts++
+		attemptStarted := time.Now()
+		h.logger.Debug("downstream attempt started",
+			"request_id", requestID,
+			"route", selectedRoute.prefix,
+			"backend", selectedBackend.name,
+			"attempt", attempts,
+		)
 		response, control, err := h.roundTrip(request.Context(), outgoing, selectedBackend, deadline)
 		if err != nil {
 			if response != nil && response.Body != nil {
@@ -178,7 +241,23 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				timeout: control.timedOut.Load() || errors.Is(err, context.DeadlineExceeded),
 			}
 			control.stop()
+			h.logger.Debug("downstream attempt failed",
+				"request_id", requestID,
+				"route", selectedRoute.prefix,
+				"backend", selectedBackend.name,
+				"attempt", attempts,
+				"duration_ms", time.Since(attemptStarted).Milliseconds(),
+				"error_kind", classifyError(err, lastFailure.timeout),
+			)
 			if request.Context().Err() != nil {
+				h.logCanceled(
+					requestID,
+					request.Method,
+					selectedRoute.prefix,
+					selectedBackend.name,
+					attempts,
+					started,
+				)
 				return
 			}
 			if !selectedBackend.retryNetworkErrors || !time.Now().Before(deadline) {
@@ -187,31 +266,39 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				return
 			}
 			selectedBackend.startCooldown(time.Now())
-			h.logRetry(requestID, selectedRoute, selectedBackend, attempts, "network_error", err)
+			h.logRetry(requestID, selectedRoute, selectedBackend, attempts, "network_error", 0, err)
 			continue
 		}
 
+		h.logger.Debug("downstream response received",
+			"request_id", requestID,
+			"route", selectedRoute.prefix,
+			"backend", selectedBackend.name,
+			"attempt", attempts,
+			"status", response.StatusCode,
+			"duration_ms", time.Since(attemptStarted).Milliseconds(),
+		)
 		statusRetry := selectedBackend.retriesStatus(response.StatusCode)
 		isEventStream := responseIsEventStream(response)
 		if response.StatusCode == http.StatusOK && isEventStream {
 			control.stopTimer()
 			h.writeLiveResponse(writer, response, true)
 			control.stop()
-			h.logSuccess(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
 			return
 		}
 		if isEventStream && !statusRetry {
 			control.stopTimer()
 			h.writeLiveResponse(writer, response, true)
 			control.stop()
-			h.logSuccess(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
 			return
 		}
 		if !statusRetry && (len(selectedBackend.retryKeywords) == 0 || responseIsEncoded(response)) {
 			control.stopTimer()
 			h.writeLiveResponse(writer, response, false)
 			control.stop()
-			h.logSuccess(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
 			return
 		}
 
@@ -228,6 +315,14 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				if request.Context().Err() != nil {
 					_ = response.Body.Close()
 					control.stop()
+					h.logCanceled(
+						requestID,
+						request.Method,
+						selectedRoute.prefix,
+						selectedBackend.name,
+						attempts,
+						started,
+					)
 					return
 				}
 				if waitErr != nil || !time.Now().Before(deadline) {
@@ -246,12 +341,20 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				}
 				_ = response.Body.Close()
 				control.stop()
-				h.logRetry(requestID, selectedRoute, selectedBackend, attempts, "status", nil)
+				h.logRetry(
+					requestID,
+					selectedRoute,
+					selectedBackend,
+					attempts,
+					"status",
+					response.StatusCode,
+					nil,
+				)
 				continue
 			}
 			h.writeLiveResponse(writer, response, false)
 			control.stop()
-			h.logSuccess(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
 			return
 		}
 		_ = response.Body.Close()
@@ -265,6 +368,14 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				timeout: control.timedOut.Load(),
 			}
 			if request.Context().Err() != nil {
+				h.logCanceled(
+					requestID,
+					request.Method,
+					selectedRoute.prefix,
+					selectedBackend.name,
+					attempts,
+					started,
+				)
 				return
 			}
 			if !selectedBackend.retryNetworkErrors || !time.Now().Before(deadline) {
@@ -273,7 +384,15 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				return
 			}
 			selectedBackend.startCooldown(time.Now())
-			h.logRetry(requestID, selectedRoute, selectedBackend, attempts, "response_read_error", readErr)
+			h.logRetry(
+				requestID,
+				selectedRoute,
+				selectedBackend,
+				attempts,
+				"response_read_error",
+				response.StatusCode,
+				readErr,
+			)
 			continue
 		}
 		control.stop()
@@ -281,7 +400,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		keywordRetry := !isEventStream && selectedBackend.containsRetryKeyword(bodyPrefix)
 		if !statusRetry && !keywordRetry {
 			h.writeBufferedResponse(writer, snapshot)
-			h.logSuccess(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
 			return
 		}
 
@@ -297,7 +416,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		if keywordRetry && !statusRetry {
 			reason = "keyword"
 		}
-		h.logRetry(requestID, selectedRoute, selectedBackend, attempts, reason, nil)
+		h.logRetry(requestID, selectedRoute, selectedBackend, attempts, reason, response.StatusCode, nil)
 	}
 }
 
@@ -509,9 +628,6 @@ func (h *Handler) writeFailure(writer http.ResponseWriter, last failure) {
 		status = http.StatusGatewayTimeout
 		message = "downstream retry deadline exceeded"
 	}
-	if last.err != nil {
-		message += ": " + last.err.Error()
-	}
 	http.Error(writer, message, status)
 }
 
@@ -533,6 +649,7 @@ func (h *Handler) logRetry(
 	selectedBackend *backend,
 	attempt int,
 	reason string,
+	status int,
 	err error,
 ) {
 	attributes := []any{
@@ -541,15 +658,18 @@ func (h *Handler) logRetry(
 		"backend", selectedBackend.name,
 		"attempt", attempt,
 		"reason", reason,
-		"retry_delay", selectedBackend.retryDelay,
+		"retry_delay_ms", selectedBackend.retryDelay.Milliseconds(),
+	}
+	if status != 0 {
+		attributes = append(attributes, "status", status)
 	}
 	if err != nil {
-		attributes = append(attributes, "error", err)
+		attributes = append(attributes, "error_kind", classifyError(err, false))
 	}
 	h.logger.Warn("retrying downstream request", attributes...)
 }
 
-func (h *Handler) logSuccess(
+func (h *Handler) logCompleted(
 	requestID uint64,
 	request *http.Request,
 	selectedRoute *route,
@@ -558,16 +678,23 @@ func (h *Handler) logSuccess(
 	started time.Time,
 	status int,
 ) {
-	h.logger.Info("request completed",
+	attributes := []any{
 		"request_id", requestID,
 		"method", request.Method,
-		"path", request.URL.Path,
 		"route", selectedRoute.prefix,
 		"backend", selectedBackend.name,
 		"attempts", attempts,
 		"status", status,
-		"duration", time.Since(started),
-	)
+		"duration_ms", time.Since(started).Milliseconds(),
+	}
+	switch {
+	case status >= http.StatusInternalServerError:
+		h.logger.Error("request completed", attributes...)
+	case status >= http.StatusBadRequest:
+		h.logger.Warn("request completed", attributes...)
+	default:
+		h.logger.Info("request completed", attributes...)
+	}
 }
 
 func (h *Handler) logFinished(
@@ -588,15 +715,88 @@ func (h *Handler) logFinished(
 	attributes := []any{
 		"request_id", requestID,
 		"method", request.Method,
-		"path", request.URL.Path,
 		"route", selectedRoute.prefix,
 		"backend", selectedBackend.name,
 		"attempts", attempts,
 		"status", status,
-		"duration", time.Since(started),
+		"duration_ms", time.Since(started).Milliseconds(),
 	}
 	if last.err != nil {
-		attributes = append(attributes, "error", last.err)
+		attributes = append(attributes, "error_kind", classifyError(last.err, last.timeout))
 	}
-	h.logger.Warn("request completed after retry exhaustion", attributes...)
+	if status >= http.StatusInternalServerError {
+		h.logger.Error("request failed after retry exhaustion", attributes...)
+	} else {
+		h.logger.Warn("request completed after retry exhaustion", attributes...)
+	}
+}
+
+func (h *Handler) logRejected(
+	requestID uint64,
+	method string,
+	route string,
+	status int,
+	reason string,
+	started time.Time,
+) {
+	attributes := []any{
+		"request_id", requestID,
+		"method", method,
+		"status", status,
+		"reason", reason,
+		"duration_ms", time.Since(started).Milliseconds(),
+	}
+	if route != "" {
+		attributes = append(attributes, "route", route)
+	}
+	h.logger.Warn("request rejected", attributes...)
+}
+
+func (h *Handler) logCanceled(
+	requestID uint64,
+	method string,
+	route string,
+	backend string,
+	attempts int,
+	started time.Time,
+) {
+	attributes := []any{
+		"request_id", requestID,
+		"method", method,
+		"route", route,
+		"attempts", attempts,
+		"duration_ms", time.Since(started).Milliseconds(),
+	}
+	if backend != "" {
+		attributes = append(attributes, "backend", backend)
+	}
+	h.logger.Debug("request canceled by client", attributes...)
+}
+
+func classifyError(err error, timedOut bool) string {
+	switch {
+	case timedOut || errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	}
+
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		return "dns"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) {
+		if networkError.Timeout() {
+			return "timeout"
+		}
+		return "network"
+	}
+	return "io"
 }

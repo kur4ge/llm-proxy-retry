@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"syscall"
 
 	"llm-proxy-retry/internal/config"
+	"llm-proxy-retry/internal/logging"
 	"llm-proxy-retry/internal/proxy"
 )
 
@@ -18,12 +18,20 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "path to the YAML configuration file")
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
+	bootstrapLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg, err := config.Load(*configFile)
 	if err != nil {
-		logger.Error("failed to load configuration", "error", err)
+		bootstrapLogger.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
+
+	logger, err := logging.New(os.Stdout, cfg.Logging.Level, cfg.Logging.Format)
+	if err != nil {
+		bootstrapLogger.Error("failed to initialize logging", "error", err)
+		os.Exit(1)
+	}
+	logger = logger.With("service", "llm-proxy")
+	slog.SetDefault(logger)
 
 	handler, err := proxy.New(cfg, logger)
 	if err != nil {
@@ -43,7 +51,11 @@ func main() {
 	shutdownSignal, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 
-	logger.Info("proxy listening", "address", cfg.Server.Listen, "config", *configFile)
+	logger.Info("proxy listening",
+		"address", cfg.Server.Listen,
+		"log_level", cfg.Logging.Level,
+		"log_format", cfg.Logging.Format,
+	)
 	serverErrors := make(chan error, 1)
 	go func() {
 		serverErrors <- server.ListenAndServe()
@@ -52,7 +64,7 @@ func main() {
 	select {
 	case err := <-serverErrors:
 		if err != nil && err != http.ErrServerClosed {
-			_, _ = fmt.Fprintln(os.Stderr, err)
+			logger.Error("server stopped unexpectedly", "error", err)
 			os.Exit(1)
 		}
 		return

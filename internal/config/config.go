@@ -14,6 +14,8 @@ import (
 )
 
 const (
+	defaultLogLevel                = "info"
+	defaultLogFormat               = "json"
 	defaultMaxRequestBodyBytes     = int64(64 << 20)
 	defaultMemoryRequestBodyBytes  = int64(1 << 20)
 	defaultMaxInspectResponseBytes = int64(4 << 20)
@@ -49,8 +51,14 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
+	Logging   LoggingConfig   `yaml:"logging"`
 	Transport TransportConfig `yaml:"transport"`
 	Routes    []RouteConfig   `yaml:"routes"`
+}
+
+type LoggingConfig struct {
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
 }
 
 type ServerConfig struct {
@@ -122,6 +130,10 @@ func Load(filename string) (*Config, error) {
 
 func defaultConfig() Config {
 	return Config{
+		Logging: LoggingConfig{
+			Level:  defaultLogLevel,
+			Format: defaultLogFormat,
+		},
 		Server: ServerConfig{
 			Listen:                      ":9917",
 			ReadHeaderTimeout:           Duration{defaultReadHeaderTimeout},
@@ -143,6 +155,26 @@ func defaultConfig() Config {
 }
 
 func (cfg *Config) applyDefaultsAndValidate() error {
+	cfg.Logging.Level = strings.ToLower(strings.TrimSpace(cfg.Logging.Level))
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = defaultLogLevel
+	}
+	switch cfg.Logging.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		return errors.New("logging.level must be one of debug, info, warn, or error")
+	}
+
+	cfg.Logging.Format = strings.ToLower(strings.TrimSpace(cfg.Logging.Format))
+	if cfg.Logging.Format == "" {
+		cfg.Logging.Format = defaultLogFormat
+	}
+	switch cfg.Logging.Format {
+	case "json", "text":
+	default:
+		return errors.New("logging.format must be either json or text")
+	}
+
 	if strings.TrimSpace(cfg.Server.Listen) == "" {
 		return errors.New("server.listen must not be empty")
 	}

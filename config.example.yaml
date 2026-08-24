@@ -8,6 +8,10 @@ server:
   max_inspect_response_body_bytes: 4194304
   temp_dir: "/app/cache"
 
+logging:
+  level: info
+  format: json
+
 transport:
   dial_timeout: 10s
   tls_handshake_timeout: 10s

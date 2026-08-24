@@ -82,6 +82,110 @@ func TestProxyRetriesStatusAndReplaysRequest(t *testing.T) {
 	}
 }
 
+func TestProxyLogsMetadataWithoutConversationDetails(t *testing.T) {
+	const (
+		requestSecret  = "private-user-prompt"
+		responseSecret = "private-model-response"
+		headerSecret   = "private-api-token"
+		querySecret    = "private-query-value"
+	)
+
+	var attempts atomic.Int32
+	downstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			writer.WriteHeader(http.StatusTooManyRequests)
+			_, _ = writer.Write([]byte(responseSecret))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"ok":true}`))
+	}))
+	defer downstream.Close()
+
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logOutput, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	proxyServer := newTestProxyWithLogger(
+		t,
+		downstream.URL+"/base?backend_secret="+querySecret,
+		func(backend *config.BackendConfig) {
+			backend.RetryDelay = duration(time.Millisecond)
+		},
+		1<<20,
+		logger,
+	)
+
+	request, err := http.NewRequest(
+		http.MethodPost,
+		proxyServer.URL+"/A/chat?prompt="+querySecret,
+		strings.NewReader(`{"prompt":"`+requestSecret+`"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+headerSecret)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	logs := logOutput.String()
+	for _, secret := range []string{requestSecret, responseSecret, headerSecret, querySecret} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("logs contain private request or response data %q: %s", secret, logs)
+		}
+	}
+	for _, expected := range []string{
+		`"level":"DEBUG"`,
+		`"level":"INFO"`,
+		`"level":"WARN"`,
+		`"route":"/A"`,
+		`"backend":"test"`,
+		`"reason":"status"`,
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("logs do not contain %q: %s", expected, logs)
+		}
+	}
+}
+
+func TestProxyDoesNotLogURLFromNetworkError(t *testing.T) {
+	const querySecret = "private-network-query"
+
+	downstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	backendURL := downstream.URL + "/base?token=" + querySecret
+	downstream.Close()
+
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logOutput, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	proxyServer := newTestProxyWithLogger(
+		t,
+		backendURL,
+		func(backend *config.BackendConfig) {
+			backend.RetryDelay = duration(50 * time.Millisecond)
+			backend.MaxRetryDuration = duration(20 * time.Millisecond)
+		},
+		1<<20,
+		logger,
+	)
+
+	response, err := http.Get(proxyServer.URL + "/A/chat?prompt=" + querySecret)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	logs := logOutput.String()
+	if strings.Contains(logs, querySecret) || strings.Contains(logs, backendURL) {
+		t.Fatalf("network error logs contain a URL or query value: %s", logs)
+	}
+	if !strings.Contains(logs, `"level":"ERROR"`) ||
+		!strings.Contains(logs, `"error_kind":`) {
+		t.Fatalf("network failure metadata is incomplete: %s", logs)
+	}
+}
+
 func TestProxyRetriesKeywordInNonSSEResponse(t *testing.T) {
 	var attempts atomic.Int32
 	downstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -314,6 +418,23 @@ func newTestProxy(
 	maxInspectBytes int64,
 ) *httptest.Server {
 	t.Helper()
+	return newTestProxyWithLogger(
+		t,
+		backendURL,
+		mutate,
+		maxInspectBytes,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+}
+
+func newTestProxyWithLogger(
+	t *testing.T,
+	backendURL string,
+	mutate func(*config.BackendConfig),
+	maxInspectBytes int64,
+	logger *slog.Logger,
+) *httptest.Server {
+	t.Helper()
 	backend := config.BackendConfig{
 		Name:               "test",
 		URL:                backendURL,
@@ -347,7 +468,7 @@ func newTestProxy(
 			Backends:    []config.BackendConfig{backend},
 		}},
 	}
-	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := New(cfg, logger)
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}

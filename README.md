@@ -31,6 +31,23 @@ go build -o llm-proxy ./cmd/llm-proxy
 
 配置使用严格校验，未知字段、重复路由、无效 URL 或非正数时间会导致进程拒绝启动。
 
+## 日志
+
+日志支持 `debug`、`info`、`warn`、`error` 四个级别，以及 `json`、`text` 两种输出格式。默认使用适合日志采集的 `info + json`：
+
+```yaml
+logging:
+  level: info
+  format: json
+```
+
+- `DEBUG`：请求进入、backend 选择、每次下游尝试及客户端取消。
+- `INFO`：服务启动、关闭以及成功请求。
+- `WARN`：请求拒绝、下游重试和 4xx 结果。
+- `ERROR`：服务故障、代理内部错误和 5xx 结果。
+
+请求日志只记录 `request_id`、方法、配置路由、backend 名称、状态码、尝试次数和耗时等元数据。请求/响应正文、Header、查询参数、完整下游 URL、命中的关键词和网络错误原文均不会写入日志。
+
 ## 路径处理
 
 `prefix` 按路径段边界匹配。例如 `/A` 匹配 `/A` 和 `/A/chat`，但不匹配 `/ABC`。多个路由同时匹配时使用最长前缀。

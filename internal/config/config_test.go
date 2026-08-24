@@ -20,6 +20,9 @@ routes:
 	if cfg.Server.Listen != ":9917" {
 		t.Fatalf("unexpected default listen address: %q", cfg.Server.Listen)
 	}
+	if cfg.Logging.Level != "info" || cfg.Logging.Format != "json" {
+		t.Fatalf("unexpected logging defaults: level=%q format=%q", cfg.Logging.Level, cfg.Logging.Format)
+	}
 	if cfg.Routes[0].Prefix != "/A" {
 		t.Fatalf("unexpected normalized prefix: %q", cfg.Routes[0].Prefix)
 	}
@@ -38,6 +41,61 @@ routes:
 	}
 	if !backend.ShouldRetryNetworkErrors() {
 		t.Fatal("network errors should be retried by default")
+	}
+}
+
+func TestLoadNormalizesLoggingConfig(t *testing.T) {
+	cfg := loadTestConfig(t, `
+logging:
+  level: DEBUG
+  format: TEXT
+routes:
+  - prefix: /
+    backends:
+      - name: primary
+        url: http://example.com
+`)
+
+	if cfg.Logging.Level != "debug" || cfg.Logging.Format != "text" {
+		t.Fatalf("unexpected logging config: level=%q format=%q", cfg.Logging.Level, cfg.Logging.Format)
+	}
+}
+
+func TestLoadRejectsInvalidLoggingConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		logging   string
+		wantError string
+	}{
+		{
+			name:      "level",
+			logging:   "level: trace\n  format: json",
+			wantError: "logging.level must be one of debug, info, warn, or error",
+		},
+		{
+			name:      "format",
+			logging:   "level: info\n  format: console",
+			wantError: "logging.format must be either json or text",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			filename := writeTestConfig(t, `
+logging:
+  `+test.logging+`
+routes:
+  - prefix: /
+    backends:
+      - name: primary
+        url: http://example.com
+`)
+
+			_, err := Load(filename)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("expected %q, got %v", test.wantError, err)
+			}
+		})
 	}
 }
 
