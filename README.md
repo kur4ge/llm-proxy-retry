@@ -101,4 +101,4 @@ GOSUMDB=sum.golang.org \
 docker compose build
 ```
 
-宿主机端口默认为 `8080`，可通过 `LLM_PROXY_PORT=18080 docker compose up -d` 修改。
+宿主机端口默认为 `8318`，可通过 `LLM_PROXY_PORT=18318 docker compose up -d` 修改。

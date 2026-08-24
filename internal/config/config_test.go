@@ -17,7 +17,7 @@ routes:
         url: https://example.com/base
 `)
 
-	if cfg.Server.Listen != ":8080" {
+	if cfg.Server.Listen != ":8318" {
 		t.Fatalf("unexpected default listen address: %q", cfg.Server.Listen)
 	}
 	if cfg.Routes[0].Prefix != "/A" {
@@ -44,7 +44,7 @@ routes:
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	filename := writeTestConfig(t, `
 server:
-  listen: ":8080"
+  listen: ":8318"
   typo: true
 routes:
   - prefix: /

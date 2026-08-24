@@ -1,5 +1,5 @@
 server:
-  listen: ":8080"
+  listen: ":8318"
   read_header_timeout: 10s
   idle_timeout: 120s
   shutdown_timeout: 15s

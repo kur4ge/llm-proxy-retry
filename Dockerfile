@@ -31,7 +31,7 @@ COPY --from=builder /runtime-tmp /tmp
 COPY --from=builder /out/llm-proxy /llm-proxy
 
 USER 65532:65532
-EXPOSE 8080
+EXPOSE 8318
 
 ENTRYPOINT ["/llm-proxy"]
 CMD ["-config", "/config.yaml"]

@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     command: ["-config", "/config.yaml"]
     ports:
-      - "${LLM_PROXY_PORT:-8080}:8080"
+      - "8318:8318"
     volumes:
       - ./config.yaml:/config.yaml:ro
     restart: unless-stopped
