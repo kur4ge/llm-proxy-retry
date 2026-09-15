@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -43,9 +44,11 @@ type failure struct {
 }
 
 type attemptControl struct {
-	cancel   context.CancelFunc
-	timer    *time.Timer
-	timedOut atomic.Bool
+	cancel          context.CancelFunc
+	timerMu         sync.Mutex
+	timer           *time.Timer
+	timerGeneration uint64
+	timedOut        atomic.Bool
 }
 
 type prefixedReadCloser struct {
@@ -281,24 +284,48 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		statusRetry := selectedBackend.retriesStatus(response.StatusCode)
 		isEventStream := responseIsEventStream(response)
 		if response.StatusCode == http.StatusOK && isEventStream {
-			control.stopTimer()
-			h.writeLiveResponse(writer, response, true)
-			control.stop()
-			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.serveLiveResponse(
+				writer,
+				request,
+				response,
+				control,
+				true,
+				requestID,
+				selectedRoute,
+				selectedBackend,
+				attempts,
+				started,
+			)
 			return
 		}
 		if isEventStream && !statusRetry {
-			control.stopTimer()
-			h.writeLiveResponse(writer, response, true)
-			control.stop()
-			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.serveLiveResponse(
+				writer,
+				request,
+				response,
+				control,
+				true,
+				requestID,
+				selectedRoute,
+				selectedBackend,
+				attempts,
+				started,
+			)
 			return
 		}
 		if !statusRetry && (len(selectedBackend.retryKeywords) == 0 || responseIsEncoded(response)) {
-			control.stopTimer()
-			h.writeLiveResponse(writer, response, false)
-			control.stop()
-			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.serveLiveResponse(
+				writer,
+				request,
+				response,
+				control,
+				false,
+				requestID,
+				selectedRoute,
+				selectedBackend,
+				attempts,
+				started,
+			)
 			return
 		}
 
@@ -326,8 +353,42 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 					return
 				}
 				if waitErr != nil || !time.Now().Before(deadline) {
-					h.writeLiveResponse(writer, response, false)
+					bytesWritten, streamErr := h.writeLiveResponse(
+						writer,
+						response,
+						false,
+						control,
+						selectedBackend.responseIdleTimeout,
+					)
+					timedOut := control.timedOut.Load()
 					control.stop()
+					if request.Context().Err() != nil {
+						h.logCanceled(
+							requestID,
+							request.Method,
+							selectedRoute.prefix,
+							selectedBackend.name,
+							attempts,
+							started,
+						)
+						return
+					}
+					if streamErr != nil {
+						h.logStreamTerminated(
+							requestID,
+							request,
+							selectedRoute,
+							selectedBackend,
+							attempts,
+							started,
+							response.StatusCode,
+							bytesWritten,
+							false,
+							streamErr,
+							timedOut,
+						)
+						return
+					}
 					h.logFinished(
 						requestID,
 						request,
@@ -352,9 +413,18 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				)
 				continue
 			}
-			h.writeLiveResponse(writer, response, false)
-			control.stop()
-			h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, response.StatusCode)
+			h.serveLiveResponse(
+				writer,
+				request,
+				response,
+				control,
+				false,
+				requestID,
+				selectedRoute,
+				selectedBackend,
+				attempts,
+				started,
+			)
 			return
 		}
 		_ = response.Body.Close()
@@ -480,17 +550,40 @@ func (h *Handler) roundTrip(
 		return nil, control, context.DeadlineExceeded
 	}
 
-	control.timer = time.AfterFunc(budget, func() {
-		control.timedOut.Store(true)
-		cancel()
-	})
+	control.armTimeout(budget)
 	response, err := h.transport.RoundTrip(request.WithContext(attemptContext))
 	return response, control, err
 }
 
-func (c *attemptControl) stopTimer() {
+func (c *attemptControl) armTimeout(timeout time.Duration) {
+	c.timerMu.Lock()
+	c.timerGeneration++
+	generation := c.timerGeneration
 	if c.timer != nil {
-		stopAndDrainTimer(c.timer)
+		c.timer.Stop()
+	}
+	c.timer = time.AfterFunc(timeout, func() {
+		c.timerMu.Lock()
+		if c.timerGeneration != generation {
+			c.timerMu.Unlock()
+			return
+		}
+		c.timer = nil
+		c.timedOut.Store(true)
+		c.timerMu.Unlock()
+		c.cancel()
+	})
+	c.timerMu.Unlock()
+}
+
+func (c *attemptControl) stopTimer() {
+	c.timerMu.Lock()
+	defer c.timerMu.Unlock()
+
+	c.timerGeneration++
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
 	}
 }
 
@@ -574,8 +667,74 @@ func joinQuery(targetQuery, requestQuery string) string {
 	}
 }
 
-func (h *Handler) writeLiveResponse(writer http.ResponseWriter, response *http.Response, flush bool) {
+func (h *Handler) serveLiveResponse(
+	writer http.ResponseWriter,
+	request *http.Request,
+	response *http.Response,
+	control *attemptControl,
+	flush bool,
+	requestID uint64,
+	selectedRoute *route,
+	selectedBackend *backend,
+	attempts int,
+	started time.Time,
+) {
+	status := response.StatusCode
+	bytesWritten, streamErr := h.writeLiveResponse(
+		writer,
+		response,
+		flush,
+		control,
+		selectedBackend.responseIdleTimeout,
+	)
+	timedOut := control.timedOut.Load()
+	control.stop()
+
+	if request.Context().Err() != nil {
+		h.logCanceled(
+			requestID,
+			request.Method,
+			selectedRoute.prefix,
+			selectedBackend.name,
+			attempts,
+			started,
+		)
+		return
+	}
+	if streamErr != nil {
+		h.logStreamTerminated(
+			requestID,
+			request,
+			selectedRoute,
+			selectedBackend,
+			attempts,
+			started,
+			status,
+			bytesWritten,
+			flush,
+			streamErr,
+			timedOut,
+		)
+		return
+	}
+	h.logCompleted(requestID, request, selectedRoute, selectedBackend, attempts, started, status)
+}
+
+func (h *Handler) writeLiveResponse(
+	writer http.ResponseWriter,
+	response *http.Response,
+	flush bool,
+	control *attemptControl,
+	idleTimeout time.Duration,
+) (int64, error) {
 	defer response.Body.Close()
+
+	control.armTimeout(idleTimeout)
+	responseController := http.NewResponseController(writer)
+	_ = responseController.SetWriteDeadline(time.Now().Add(idleTimeout))
+	defer func() {
+		_ = responseController.SetWriteDeadline(time.Time{})
+	}()
 
 	header := response.Header.Clone()
 	removeHopByHopHeaders(header)
@@ -584,29 +743,40 @@ func (h *Handler) writeLiveResponse(writer http.ResponseWriter, response *http.R
 	writer.WriteHeader(response.StatusCode)
 
 	if flush {
-		if flusher, ok := writer.(http.Flusher); ok {
-			flusher.Flush()
+		if err := responseController.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return 0, err
 		}
 	}
 
 	buffer := make([]byte, 32<<10)
+	var bytesWritten int64
 	for {
 		n, readErr := response.Body.Read(buffer)
 		if n > 0 {
-			if _, writeErr := writer.Write(buffer[:n]); writeErr != nil {
-				return
+			_ = responseController.SetWriteDeadline(time.Now().Add(idleTimeout))
+			written, writeErr := writer.Write(buffer[:n])
+			bytesWritten += int64(written)
+			if writeErr != nil {
+				return bytesWritten, writeErr
+			}
+			if written != n {
+				return bytesWritten, io.ErrShortWrite
 			}
 			if flush {
-				if flusher, ok := writer.(http.Flusher); ok {
-					flusher.Flush()
+				if err := responseController.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+					return bytesWritten, err
 				}
 			}
+			control.armTimeout(idleTimeout)
 		}
 		if readErr != nil {
-			break
+			if errors.Is(readErr, io.EOF) {
+				writeTrailers(writer.Header(), response.Trailer)
+				return bytesWritten, nil
+			}
+			return bytesWritten, readErr
 		}
 	}
-	writeTrailers(writer.Header(), response.Trailer)
 }
 
 func (h *Handler) writeBufferedResponse(writer http.ResponseWriter, response *bufferedResponse) {
@@ -695,6 +865,34 @@ func (h *Handler) logCompleted(
 	default:
 		h.logger.Info("request completed", attributes...)
 	}
+}
+
+func (h *Handler) logStreamTerminated(
+	requestID uint64,
+	request *http.Request,
+	selectedRoute *route,
+	selectedBackend *backend,
+	attempts int,
+	started time.Time,
+	status int,
+	bytesWritten int64,
+	eventStream bool,
+	err error,
+	timedOut bool,
+) {
+	h.logger.Warn("response stream terminated",
+		"request_id", requestID,
+		"method", request.Method,
+		"route", selectedRoute.prefix,
+		"backend", selectedBackend.name,
+		"attempts", attempts,
+		"status", status,
+		"bytes_written", bytesWritten,
+		"event_stream", eventStream,
+		"response_idle_timeout_ms", selectedBackend.responseIdleTimeout.Milliseconds(),
+		"duration_ms", time.Since(started).Milliseconds(),
+		"error_kind", classifyError(err, timedOut),
+	)
 }
 
 func (h *Handler) logFinished(

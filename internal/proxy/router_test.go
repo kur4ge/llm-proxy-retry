@@ -118,12 +118,13 @@ func testRouteConfig(prefix, name string, weight int) config.RouteConfig {
 
 func testBackendConfig(name string, weight int) config.BackendConfig {
 	return config.BackendConfig{
-		Name:             name,
-		URL:              "http://example.com",
-		Weight:           weight,
-		RetryDelay:       config.Duration{Duration: time.Second},
-		MaxRetryDuration: config.Duration{Duration: time.Minute},
-		AttemptTimeout:   config.Duration{Duration: time.Second},
-		RetryStatuses:    []int{429},
+		Name:                name,
+		URL:                 "http://example.com",
+		Weight:              weight,
+		RetryDelay:          config.Duration{Duration: time.Second},
+		MaxRetryDuration:    config.Duration{Duration: time.Minute},
+		AttemptTimeout:      config.Duration{Duration: time.Second},
+		ResponseIdleTimeout: config.Duration{Duration: time.Second},
+		RetryStatuses:       []int{429},
 	}
 }

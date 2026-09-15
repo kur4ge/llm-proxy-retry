@@ -88,16 +88,17 @@ type RouteConfig struct {
 }
 
 type BackendConfig struct {
-	Name               string   `yaml:"name"`
-	URL                string   `yaml:"url"`
-	Weight             int      `yaml:"weight"`
-	RetryDelay         Duration `yaml:"retry_delay"`
-	MaxRetryDuration   Duration `yaml:"max_retry_duration"`
-	AttemptTimeout     Duration `yaml:"attempt_timeout"`
-	RetryStatuses      []int    `yaml:"retry_statuses"`
-	RetryKeywords      []string `yaml:"retry_keywords"`
-	RetryNetworkErrors *bool    `yaml:"retry_network_errors"`
-	PreserveHost       bool     `yaml:"preserve_host"`
+	Name                string   `yaml:"name"`
+	URL                 string   `yaml:"url"`
+	Weight              int      `yaml:"weight"`
+	RetryDelay          Duration `yaml:"retry_delay"`
+	MaxRetryDuration    Duration `yaml:"max_retry_duration"`
+	AttemptTimeout      Duration `yaml:"attempt_timeout"`
+	ResponseIdleTimeout Duration `yaml:"response_idle_timeout"`
+	RetryStatuses       []int    `yaml:"retry_statuses"`
+	RetryKeywords       []string `yaml:"retry_keywords"`
+	RetryNetworkErrors  *bool    `yaml:"retry_network_errors"`
+	PreserveHost        bool     `yaml:"preserve_host"`
 }
 
 func Load(filename string) (*Config, error) {
@@ -308,6 +309,16 @@ func applyBackendDefaultsAndValidate(backend *BackendConfig, routePrefix string,
 	}
 	if backend.AttemptTimeout.Duration <= 0 {
 		return fmt.Errorf("route %q backend %q attempt_timeout must be greater than zero", routePrefix, backend.Name)
+	}
+	if backend.ResponseIdleTimeout.Duration == 0 {
+		backend.ResponseIdleTimeout.Duration = backend.AttemptTimeout.Duration
+	}
+	if backend.ResponseIdleTimeout.Duration <= 0 {
+		return fmt.Errorf(
+			"route %q backend %q response_idle_timeout must be greater than zero",
+			routePrefix,
+			backend.Name,
+		)
 	}
 	if len(backend.RetryStatuses) == 0 {
 		backend.RetryStatuses = []int{429}

@@ -317,6 +317,105 @@ func TestProxyFlushesSSEBeforeDownstreamCloses(t *testing.T) {
 	}
 }
 
+func TestProxyTerminatesStalledSSEAfterIdleTimeout(t *testing.T) {
+	downstreamCanceled := make(chan struct{})
+	downstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: first\n\n"))
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+		close(downstreamCanceled)
+	}))
+	defer downstream.Close()
+
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logOutput, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	proxyServer := newTestProxyWithLogger(
+		t,
+		downstream.URL,
+		func(backend *config.BackendConfig) {
+			backend.ResponseIdleTimeout = duration(50 * time.Millisecond)
+		},
+		1<<20,
+		logger,
+	)
+
+	response, err := http.Get(proxyServer.URL + "/A/chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	reader := bufio.NewReader(response.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first SSE line: %v", err)
+	}
+	if line != "data: first\n" {
+		t.Fatalf("unexpected first SSE line: %q", line)
+	}
+
+	bodyEnded := make(chan error, 1)
+	go func() {
+		_, readErr := io.Copy(io.Discard, reader)
+		bodyEnded <- readErr
+	}()
+
+	select {
+	case <-bodyEnded:
+	case <-time.After(time.Second):
+		t.Fatal("stalled SSE body was not terminated")
+	}
+	select {
+	case <-downstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("stalled downstream request was not canceled")
+	}
+
+	logs := logOutput.String()
+	for _, expected := range []string{
+		`"msg":"response stream terminated"`,
+		`"status":200`,
+		`"event_stream":true`,
+		`"error_kind":"timeout"`,
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("logs do not contain %q: %s", expected, logs)
+		}
+	}
+}
+
+func TestProxyKeepsActiveSSEAliveBeyondIdleTimeout(t *testing.T) {
+	downstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range []string{"one", "two", "three", "four"} {
+			_, _ = writer.Write([]byte("data: " + event + "\n\n"))
+			writer.(http.Flusher).Flush()
+			time.Sleep(30 * time.Millisecond)
+		}
+	}))
+	defer downstream.Close()
+
+	proxyServer := newTestProxy(t, downstream.URL, func(backend *config.BackendConfig) {
+		backend.ResponseIdleTimeout = duration(75 * time.Millisecond)
+	}, 1<<20)
+
+	response, err := http.Get(proxyServer.URL + "/A/chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const expected = "data: one\n\ndata: two\n\ndata: three\n\ndata: four\n\n"
+	if string(body) != expected {
+		t.Fatalf("unexpected SSE body: %q", body)
+	}
+}
+
 func TestProxyRetriesSSEByStatusBeforeStreaming(t *testing.T) {
 	var attempts atomic.Int32
 	downstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -436,14 +535,15 @@ func newTestProxyWithLogger(
 ) *httptest.Server {
 	t.Helper()
 	backend := config.BackendConfig{
-		Name:               "test",
-		URL:                backendURL,
-		Weight:             1,
-		RetryDelay:         duration(2 * time.Millisecond),
-		MaxRetryDuration:   duration(500 * time.Millisecond),
-		AttemptTimeout:     duration(250 * time.Millisecond),
-		RetryStatuses:      []int{http.StatusTooManyRequests},
-		RetryNetworkErrors: boolPointer(true),
+		Name:                "test",
+		URL:                 backendURL,
+		Weight:              1,
+		RetryDelay:          duration(2 * time.Millisecond),
+		MaxRetryDuration:    duration(500 * time.Millisecond),
+		AttemptTimeout:      duration(250 * time.Millisecond),
+		ResponseIdleTimeout: duration(250 * time.Millisecond),
+		RetryStatuses:       []int{http.StatusTooManyRequests},
+		RetryNetworkErrors:  boolPointer(true),
 	}
 	if mutate != nil {
 		mutate(&backend)

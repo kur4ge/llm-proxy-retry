@@ -30,6 +30,7 @@ routes:
         retry_delay: 2s
         max_retry_duration: 600s
         attempt_timeout: 60s
+        response_idle_timeout: 60s
         retry_statuses: [429, 500, 502, 503, 504]
         retry_keywords:
           - rate limit
@@ -43,6 +44,7 @@ routes:
         retry_delay: 5s
         max_retry_duration: 600s
         attempt_timeout: 60s
+        response_idle_timeout: 60s
         retry_statuses: [429, 503]
         retry_keywords:
           - temporarily unavailable

@@ -36,6 +36,13 @@ routes:
 	if backend.MaxRetryDuration.Duration != 600*time.Second {
 		t.Fatalf("unexpected default retry duration: %s", backend.MaxRetryDuration.Duration)
 	}
+	if backend.ResponseIdleTimeout.Duration != backend.AttemptTimeout.Duration {
+		t.Fatalf(
+			"response idle timeout %s does not inherit attempt timeout %s",
+			backend.ResponseIdleTimeout.Duration,
+			backend.AttemptTimeout.Duration,
+		)
+	}
 	if len(backend.RetryStatuses) != 1 || backend.RetryStatuses[0] != 429 {
 		t.Fatalf("unexpected default retry statuses: %v", backend.RetryStatuses)
 	}
@@ -96,6 +103,38 @@ routes:
 				t.Fatalf("expected %q, got %v", test.wantError, err)
 			}
 		})
+	}
+}
+
+func TestLoadResponseIdleTimeout(t *testing.T) {
+	cfg := loadTestConfig(t, `
+routes:
+  - prefix: /
+    backends:
+      - name: primary
+        url: http://example.com
+        attempt_timeout: 30s
+        response_idle_timeout: 45s
+`)
+
+	if timeout := cfg.Routes[0].Backends[0].ResponseIdleTimeout.Duration; timeout != 45*time.Second {
+		t.Fatalf("unexpected response idle timeout: %s", timeout)
+	}
+}
+
+func TestLoadRejectsInvalidResponseIdleTimeout(t *testing.T) {
+	filename := writeTestConfig(t, `
+routes:
+  - prefix: /
+    backends:
+      - name: primary
+        url: http://example.com
+        response_idle_timeout: -1s
+`)
+
+	_, err := Load(filename)
+	if err == nil || !strings.Contains(err.Error(), "response_idle_timeout must be greater than zero") {
+		t.Fatalf("expected response idle timeout error, got %v", err)
 	}
 }
 

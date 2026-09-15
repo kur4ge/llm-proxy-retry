@@ -25,17 +25,18 @@ type route struct {
 }
 
 type backend struct {
-	name               string
-	target             *url.URL
-	weight             int64
-	currentWeight      int64
-	retryDelay         time.Duration
-	maxRetryDuration   time.Duration
-	attemptTimeout     time.Duration
-	retryStatuses      map[int]struct{}
-	retryKeywords      [][]byte
-	retryNetworkErrors bool
-	preserveHost       bool
+	name                string
+	target              *url.URL
+	weight              int64
+	currentWeight       int64
+	retryDelay          time.Duration
+	maxRetryDuration    time.Duration
+	attemptTimeout      time.Duration
+	responseIdleTimeout time.Duration
+	retryStatuses       map[int]struct{}
+	retryKeywords       [][]byte
+	retryNetworkErrors  bool
+	preserveHost        bool
 
 	cooldownMu    sync.Mutex
 	cooldownUntil time.Time
@@ -63,16 +64,17 @@ func newRouter(routeConfigs []config.RouteConfig) (*router, error) {
 				keywords = append(keywords, []byte(keyword))
 			}
 			item.backends = append(item.backends, &backend{
-				name:               backendConfig.Name,
-				target:             target,
-				weight:             int64(backendConfig.Weight),
-				retryDelay:         backendConfig.RetryDelay.Duration,
-				maxRetryDuration:   backendConfig.MaxRetryDuration.Duration,
-				attemptTimeout:     backendConfig.AttemptTimeout.Duration,
-				retryStatuses:      statuses,
-				retryKeywords:      keywords,
-				retryNetworkErrors: backendConfig.ShouldRetryNetworkErrors(),
-				preserveHost:       backendConfig.PreserveHost,
+				name:                backendConfig.Name,
+				target:              target,
+				weight:              int64(backendConfig.Weight),
+				retryDelay:          backendConfig.RetryDelay.Duration,
+				maxRetryDuration:    backendConfig.MaxRetryDuration.Duration,
+				attemptTimeout:      backendConfig.AttemptTimeout.Duration,
+				responseIdleTimeout: backendConfig.ResponseIdleTimeout.Duration,
+				retryStatuses:       statuses,
+				retryKeywords:       keywords,
+				retryNetworkErrors:  backendConfig.ShouldRetryNetworkErrors(),
+				preserveHost:        backendConfig.PreserveHost,
 			})
 		}
 		routes = append(routes, item)
