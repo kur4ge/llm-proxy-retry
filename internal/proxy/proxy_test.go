@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -507,6 +508,12 @@ func TestProxyReturnsOversizedLastErrorAtDeadline(t *testing.T) {
 	}
 	if attempts.Load() != 1 {
 		t.Fatalf("expected one attempt, got %d", attempts.Load())
+	}
+}
+
+func TestClassifyErrorRecognizesPermissionDenied(t *testing.T) {
+	if got := classifyError(syscall.EACCES, false); got != "permission_denied" {
+		t.Fatalf("expected permission_denied, got %q", got)
 	}
 }
 

@@ -27,7 +27,7 @@ RUN go build \
 FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /runtime-cache /app/cache
+COPY --from=builder --chown=65532:65532 /runtime-cache /app/cache
 COPY --from=builder /out/llm-proxy /app/llm-proxy
 
 WORKDIR /app

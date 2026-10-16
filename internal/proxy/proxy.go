@@ -977,6 +977,8 @@ func classifyError(err error, timedOut bool) string {
 		return "timeout"
 	case errors.Is(err, context.Canceled):
 		return "canceled"
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+		return "permission_denied"
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "connection_refused"
 	case errors.Is(err, syscall.ECONNRESET):
